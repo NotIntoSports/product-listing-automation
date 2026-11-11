@@ -1,0 +1,25 @@
+# Credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+cookies*
+*storage-state*.json
+*storageState*.json
+
+# Business data and execution artifacts
+.rpa-runs/
+outputs/
+product-data/
+trace/
+logs/
+tmp/
+*.log
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
