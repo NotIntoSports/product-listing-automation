@@ -293,6 +293,34 @@ export function decide(state, now = new Date().toISOString()) {
     total: actions.length, counts, actions };
 }
 
+// Presentation only: retain full decisions and evidence in the checkpoint/API.
+function summarize(decision, change) {
+  const executable = new Set(['reconcile', 'writeback', 'verify', 'diagnose', 'recover', 'resume']);
+  const needsDiagnosis = item => Boolean(item.fault && (!item.fault.recoverable || item.fault.repeats >= 2));
+  const candidates = decision.actions.filter(item => executable.has(item.action));
+  const next = (decision.orchestrationAction === 'diagnose_then_resume' && candidates.find(needsDiagnosis)) || candidates[0];
+  const checks = decision.actions.filter(item => item.status === 'submitted' && item.nextCheckAt != null);
+  const earliest = checks.reduce((first, item) => !first || Date.parse(item.nextCheckAt) < Date.parse(first)
+    ? item.nextCheckAt : first, null);
+  const control = decision.browserControl;
+  const summary = {
+    batchId: decision.batchId, revision: decision.revision, worker: decision.worker,
+    decisionsOnly: decision.decisionsOnly, canFinish: decision.canFinish,
+    orchestrationAction: decision.orchestrationAction,
+    browserControl: control ? { spaceId: control.spaceId, held: control.held,
+      method: control.method ?? null, releaseConfirmed: !control.held && Boolean(control.releaseEvidence) } : null,
+    cleanupMethod: decision.cleanupMethod, total: decision.total, counts: decision.counts,
+    earliestNextCheckAt: earliest,
+    nextAction: next ? { recordId: next.recordId, status: next.status, businessStatus: next.businessStatus,
+      action: next.action, origin: next.origin, itemId: next.itemId, nextCheckAt: next.nextCheckAt,
+      diagnosisRequired: needsDiagnosis(next) } : null,
+  };
+  // A count stays bounded even when one mutation affects hundreds of IDs.
+  if (change) summary.changed = { type: change.type,
+    recordCount: change.recordIds?.length ?? (change.recordId ? 1 : 0) };
+  return summary;
+}
+
 function readJson(file) { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
 function atomicWrite(file, value) {
   const temp = `${file}.${process.pid}.tmp`;
@@ -330,14 +358,29 @@ export function updateFile(file, command, request) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [command, file, request] = process.argv.slice(2);
+    const [command, file, ...options] = process.argv.slice(2);
     if (command === '--help' || !command) {
-      console.log('Usage: node run_state.mjs init|apply <state.json> <request.json>\n       node run_state.mjs inspect <state.json>\nLocal decisions only. The supervisor must invoke agent tools; this is not a daemon.');
+      requireThat(!file && options.length === 0, 'unexpected arguments after --help');
+      console.log('Usage: node run_state.mjs init|apply <state.json> <request.json>\n       node run_state.mjs inspect <state.json> [--record <id> | --full]\nDefault output is a compact summary; --record includes one full record and --full returns all decisions.\nLocal decisions only. The supervisor must invoke agent tools; this is not a daemon.');
     } else {
-      requireThat(file, 'state path required');
+      requireThat(['init', 'apply', 'inspect'].includes(command), 'invalid command');
+      requireThat(file && !file.startsWith('--'), 'state path required');
       let result;
-      if (command === 'inspect') result = decide(readJson(file));
-      else { requireThat(request, 'JSON request file required'); result = updateFile(file, command, readJson(request)); }
+      if (command === 'inspect') {
+        const full = options.length === 1 && options[0] === '--full';
+        const single = options.length === 2 && options[0] === '--record' && options[1] && !options[1].startsWith('--');
+        requireThat(options.length === 0 || full || single, 'inspect accepts only --record <id> or --full');
+        const state = readJson(file), decision = decide(state);
+        result = full ? decision : summarize(decision);
+        if (single) {
+          const item = itemFor(state, options[1]);
+          result.record = { ...item, ...decision.actions.find(action => action.recordId === item.recordId) };
+        }
+      } else {
+        requireThat(options.length === 1 && !options[0].startsWith('--'), 'init/apply require one JSON request file and no flags');
+        const request = readJson(options[0]);
+        result = summarize(updateFile(file, command, request), command === 'apply' ? request : undefined);
+      }
       console.log(JSON.stringify(result, null, 2));
     }
   } catch (error) {

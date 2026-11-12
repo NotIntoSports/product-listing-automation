@@ -86,7 +86,7 @@ test('submit intent survives a separate process and prevents a duplicate platfor
   const cli = fileURLToPath(new URL('../skills/product-listing/scripts/run_state.mjs', import.meta.url));
   const inspect = spawnSync(process.execPath, [cli, 'inspect', stateFile], { encoding: 'utf8' });
   assert.equal(inspect.status, 0, inspect.stderr);
-  assert.equal(JSON.parse(inspect.stdout).actions[0].action, 'reconcile');
+  assert.equal(JSON.parse(inspect.stdout).nextAction.action, 'reconcile');
   assert.throws(() => updateFile(stateFile, 'apply', { expectedRevision: 2, type: 'begin_submit', workerId: 'worker-one', generation: 1, recordId: 'recA', attemptId: 'two' }), /reconcile first/);
   assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).revision, 2);
 });
@@ -345,4 +345,206 @@ test('a user stop hands off browser control only after the executor has actually
   assert.equal(h.decision().canFinish, true);
   assert.equal(h.decision().orchestrationAction, 'respect_stop');
   assert.equal(h.state.items[0].status, 'pending');
+});
+
+function cliFixture(t, state) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'listing-cli-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stateFile = path.join(dir, 'state.json'), requestFile = path.join(dir, 'request.json');
+  const script = fileURLToPath(new URL('../skills/product-listing/scripts/run_state.mjs', import.meta.url));
+  if (state) fs.writeFileSync(stateFile, JSON.stringify(state));
+  return {
+    stateFile,
+    request(value) { fs.writeFileSync(requestFile, JSON.stringify(value)); return requestFile; },
+    invoke(...args) {
+      return spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    },
+    run(...args) {
+      const result = this.invoke(...args);
+      assert.equal(result.status, 0, result.stderr || String(result.error));
+      return { output: JSON.parse(result.stdout), bytes: Buffer.byteLength(result.stdout), raw: result.stdout };
+    },
+    saved() { return JSON.parse(fs.readFileSync(stateFile, 'utf8')); },
+  };
+}
+
+test('CLI defaults stay bounded for 56 and 500 records while full inspection remains available', t => {
+  const sizes = [];
+  for (const total of [56, 500]) {
+    const fixture = cliFixture(t);
+    const request = fixture.request({ batchId: 'output-size', recordIds: Array.from({ length: total }, (_, i) => `rec-${i}`) });
+    const initialized = fixture.run('init', fixture.stateFile, request);
+    const compact = fixture.run('inspect', fixture.stateFile);
+    const full = fixture.run('inspect', fixture.stateFile, '--full');
+    assert.deepEqual(initialized.output, compact.output);
+    assert.equal(compact.output.total, total);
+    assert.deepEqual(compact.output.counts, { resume: total });
+    assert.equal(compact.output.nextAction.recordId, 'rec-0');
+    assert.equal('actions' in compact.output, false);
+    assert.ok(compact.bytes < 1500, `${total} records produced ${compact.bytes} bytes`);
+    assert.equal(full.output.actions.length, total);
+    assert.equal(fixture.saved().items.length, total);
+    for (const key of ['batchId', 'revision', 'worker', 'decisionsOnly', 'canFinish', 'orchestrationAction', 'browserControl', 'cleanupMethod', 'total', 'counts']) {
+      assert.deepEqual(compact.output[key], full.output[key], `${key} compatibility`);
+    }
+    sizes.push({ records: total, previousFullBytes: full.bytes, defaultBytes: compact.bytes });
+  }
+  assert.ok(Math.abs(sizes[1].defaultBytes - sizes[0].defaultBytes) < 20);
+  t.diagnostic(`Measured CLI output bytes: ${JSON.stringify(sizes)}`);
+});
+
+test('CLI next action finds the last unfinished record past complete and blocked records', t => {
+  const state = createState({ batchId: 'last-pending', recordIds: Array.from({ length: 500 }, (_, i) => `rec-${i}`) });
+  for (const [i, item] of state.items.entries()) {
+    if (i < 250) Object.assign(item, { status: 'verified', itemId: `item-${i}`, writebackVerified: true });
+    else if (i < 499) Object.assign(item, { status: 'blocked', writebackVerified: true,
+      blocker: { kind: 'platform', evidence: 'fixture blocker', resume: { status: 'pending' } } });
+  }
+  const fixture = cliFixture(t, state);
+  const { output, bytes } = fixture.run('inspect', fixture.stateFile);
+  assert.deepEqual(output.counts, { complete: 250, blocked: 249, resume: 1 });
+  assert.equal(output.nextAction.recordId, 'rec-499');
+  assert.equal(output.nextAction.action, 'resume');
+  assert.equal(output.canFinish, false);
+  assert.ok(bytes < 1500);
+});
+
+test('CLI summary omits long evidence and prose while single and full inspection preserve it', t => {
+  const secret = 'TEST_EVIDENCE_CANARY_' + 'z'.repeat(50000);
+  const h = harness(); h.assign();
+  h.work('step', { step: secret, progressKey: secret });
+  h.work('fault', { code: secret, message: secret, recoverable: true });
+  h.event('control_acquired', { spaceId: 'mock-space', evidence: secret }); h.done();
+  const fixture = cliFixture(t, h.state);
+  const compact = fixture.run('inspect', fixture.stateFile);
+  assert.equal(compact.raw.includes('TEST_EVIDENCE_CANARY_'), false);
+  assert.ok(compact.bytes < 1500);
+  assert.deepEqual(compact.output.browserControl, { spaceId: 'mock-space', held: true, method: null, releaseConfirmed: false });
+  const single = fixture.run('inspect', fixture.stateFile, '--record', 'recA').output;
+  assert.equal(single.record.step, secret);
+  assert.equal(single.record.progressKey, secret);
+  assert.equal(single.record.fault.message, secret);
+  assert.equal(single.record.action, 'recover');
+  assert.equal('actions' in single, false);
+  const full = fixture.run('inspect', fixture.stateFile, '--full').output;
+  assert.equal(full.actions[0].step, secret);
+  assert.equal(full.actions[0].fault.code, secret);
+  assert.equal(full.browserControl.evidence, secret);
+  assert.deepEqual(fixture.saved(), h.state);
+});
+
+test('CLI mutation summaries retain every saved record, evidence, and history event', t => {
+  const fixture = cliFixture(t);
+  const proof = 'SAVED_EVIDENCE_' + 'v'.repeat(20000);
+  const records = Array.from({ length: 500 }, (_, i) => `rec-${i}`);
+  fixture.run('init', fixture.stateFile, fixture.request({ batchId: 'persist-all', recordIds: records }));
+  const result = fixture.run('apply', fixture.stateFile, fixture.request({ expectedRevision: 0, type: 'block',
+    recordIds: records, kind: 'auth', evidence: proof, nextAction: 'restore access', writebackUnavailableEvidence: proof }));
+  assert.deepEqual(result.output.changed, { type: 'block', recordCount: 500 });
+  assert.equal(result.raw.includes('SAVED_EVIDENCE_'), false);
+  assert.equal('recordIds' in result.output.changed, false);
+  assert.equal(result.output.nextAction, null);
+  assert.ok(result.bytes < 1500);
+  const saved = fixture.saved();
+  assert.equal(saved.items.length, 500);
+  assert.equal(saved.items.every(item => item.blocker.evidence === proof && item.writebackUnavailableEvidence === proof), true);
+  assert.deepEqual(saved.history[0].recordIds, records);
+  assert.equal(saved.history[0].evidence, proof);
+  const single = fixture.run('inspect', fixture.stateFile, '--record', 'rec-499').output;
+  assert.equal(single.record.blocker.evidence, proof);
+  assert.equal(single.record.writebackUnavailableEvidence, proof);
+  assert.equal(single.record.action, 'blocked');
+});
+
+test('CLI single record includes receipt, verification, and writeback evidence after real mutations', t => {
+  const fixture = cliFixture(t);
+  fixture.run('init', fixture.stateFile, fixture.request({ batchId: 'evidence-path', recordIds: ['recA'] }));
+  const events = [
+    { type: 'assign', workerId: 'worker-one' },
+    { type: 'begin_submit', workerId: 'worker-one', generation: 1, recordId: 'recA', attemptId: 'attempt-one' },
+    { type: 'receipt', workerId: 'worker-one', generation: 1, recordId: 'recA', itemId: 'item-one', evidence: 'receipt proof' },
+    { type: 'verify', workerId: 'worker-one', generation: 1, recordId: 'recA', itemId: 'item-one', outcome: 'warehouse', evidence: 'verification proof' },
+    { type: 'writeback', workerId: 'worker-one', generation: 1, recordId: 'recA', readbackConfirmed: true, evidence: 'writeback proof' },
+    { type: 'worker_report', workerId: 'worker-one', generation: 1, kind: 'done' },
+  ];
+  for (const [expectedRevision, event] of events.entries()) {
+    const { output } = fixture.run('apply', fixture.stateFile, fixture.request({ ...event, expectedRevision }));
+    assert.equal(output.revision, expectedRevision + 1);
+    assert.deepEqual(output.changed, { type: event.type, recordCount: event.recordId ? 1 : 0 });
+    assert.equal('actions' in output, false);
+  }
+  const saved = fixture.saved();
+  const single = fixture.run('inspect', fixture.stateFile, '--record', 'recA').output;
+  assert.equal(single.record.receiptEvidence, 'receipt proof');
+  assert.equal(single.record.verificationEvidence, 'verification proof');
+  assert.equal(single.record.writebackEvidence, 'writeback proof');
+  assert.equal(single.record.attemptId, 'attempt-one');
+  assert.equal(single.record.action, 'complete');
+  assert.equal(single.nextAction, null);
+  assert.equal(single.canFinish, true);
+  assert.equal(saved.history.length, events.length);
+  assert.deepEqual(fixture.run('inspect', fixture.stateFile, '--full').output, decide(saved));
+});
+
+test('CLI rejects invalid flags and out-of-batch records without writing any state', t => {
+  const fixture = cliFixture(t);
+  const request = fixture.request({ batchId: 'argument-test', recordIds: ['recA'] });
+  assert.notEqual(fixture.invoke('init', fixture.stateFile, request, '--full').status, 0);
+  assert.equal(fs.existsSync(fixture.stateFile), false);
+  fixture.run('init', fixture.stateFile, request);
+  const before = fs.readFileSync(fixture.stateFile, 'utf8');
+  fixture.request({ type: 'assign', expectedRevision: 0, workerId: 'worker-one' });
+  for (const args of [
+    ['apply', fixture.stateFile, request, '--full'],
+    ['inspect', fixture.stateFile, '--unknown'],
+    ['inspect', fixture.stateFile, '--record'],
+    ['inspect', fixture.stateFile, '--record', 'outside-batch'],
+    ['inspect', fixture.stateFile, '--record', 'recA', '--full'],
+    ['inspect', fixture.stateFile, '--full', '--full'],
+    ['inspect', fixture.stateFile, '--record', '--full'],
+    ['--help', 'unexpected'],
+  ]) {
+    const result = fixture.invoke(...args);
+    assert.notEqual(result.status, 0, args.join(' '));
+    assert.equal(result.stdout, '');
+    assert.equal(JSON.parse(result.stderr).ok, false);
+    assert.equal(fs.readFileSync(fixture.stateFile, 'utf8'), before);
+    assert.equal(fs.existsSync(fixture.stateFile + '.lock'), false);
+  }
+});
+
+test('CLI summary exposes the earliest verification and confirmed browser release without evidence', t => {
+  const state = createState({ batchId: 'waiting', recordIds: ['recA', 'recB'] });
+  const later = new Date(Date.now() + 120000).toISOString(), earlier = new Date(Date.now() + 60000).toISOString();
+  for (const [i, item] of state.items.entries()) Object.assign(item, {
+    status: 'submitted', itemId: `item-${i}`, writebackVerified: true, nextCheckAt: i ? earlier : later,
+  });
+  state.browserControl = { spaceId: 'space-one', held: true, evidence: 'control evidence' };
+  const fixture = cliFixture(t, state);
+  const before = fixture.run('inspect', fixture.stateFile).output;
+  assert.equal(before.earliestNextCheckAt, earlier);
+  assert.equal(before.nextAction, null);
+  assert.equal(before.canFinish, false);
+  assert.equal(before.cleanupMethod, 'finish');
+  assert.equal(before.browserControl.releaseConfirmed, false);
+  const result = fixture.run('apply', fixture.stateFile, fixture.request({ type: 'control_released', expectedRevision: 0,
+    method: 'finish', evidence: 'RELEASE_PROOF_' + 'a'.repeat(50000) }));
+  assert.equal(result.output.browserControl.releaseConfirmed, true);
+  assert.equal(result.output.browserControl.held, false);
+  assert.equal(result.output.browserControl.method, 'finish');
+  assert.equal(result.output.canFinish, true);
+  assert.equal(result.raw.includes('RELEASE_PROOF_'), false);
+  assert.ok(result.bytes < 1500);
+});
+
+test('CLI next action prioritizes diagnosis while retaining the specific writeback action', t => {
+  const h = harness(['recA', 'recB']); h.assign(); h.receipt('recB', 'item-two');
+  h.work('fault', { recordId: 'recB', code: 'writeback_failed', message: 'temporary transport issue', recoverable: true });
+  h.work('fault', { recordId: 'recB', code: 'writeback_failed', message: 'same transport issue', recoverable: true }); h.done();
+  const fixture = cliFixture(t, h.state);
+  const { output } = fixture.run('inspect', fixture.stateFile);
+  assert.equal(output.orchestrationAction, 'diagnose_then_resume');
+  assert.equal(output.nextAction.recordId, 'recB');
+  assert.equal(output.nextAction.action, 'writeback');
+  assert.equal(output.nextAction.diagnosisRequired, true);
 });

@@ -29,6 +29,8 @@
 
 平台预检等待不阻塞后续提交。普通提示或可选资料疑点不自动升级为阻塞；单条失败后继续其他可处理链接。提交结果不明时先核实，避免重复发布。既有商品不计作本次发布成果。
 
+技能按角色读取：总控读监督与验收，执行者读平台和数据流程；故障排查、看板和建表资料只在对应任务需要时读取。状态脚本默认只返回摘要与下一条动作，完整记录和证据仍保存在状态文件中。
+
 ## 使用前准备
 
 - 可以加载本地 `SKILL.md` 的 Codex 环境。
@@ -77,11 +79,13 @@ $product-listing 优化运营看板，并检查源数据已修改但指标没有
 skills/product-listing/
 ├── SKILL.md                 技能入口与任务路由
 ├── references/
-│   ├── feishu.md            数据结构、资料维护与看板规则
+│   ├── feishu.md            数据结构与资料维护
+│   ├── dashboard.md         按需读取的看板统计规则
 │   ├── setup.md             初始化表、关联和工作视图
-│   ├── supervision.md       总控派发、监督、状态与控制权释放
+│   ├── supervision.md       总控派发、监督、验收与控制权释放
+│   ├── state-api.md         状态命令、输出模式与事件字段
 │   ├── recovery.md          普通中断排查与失败回滚
-│   └── tmall.md             预检、提交、核实、异常处理与汇报
+│   └── tmall.md             执行者的天猫预检、提交与核实
 └── scripts/run_state.mjs    本地持久化状态与结束门禁
 
 tests/run_state.test.mjs     故障注入与恢复测试
@@ -93,6 +97,8 @@ tests/run_state.test.mjs     故障注入与恢复测试
 node --test tests/run_state.test.mjs
 ```
 
-测试使用临时目录和合成记录，不连接飞书或千牛，不发布商品。状态脚本的调用、事件字段和浏览器收尾要求见 [supervision.md](skills/product-listing/references/supervision.md)。模拟测试通过不等于真实店铺发布已验证。
+测试使用临时目录和合成记录，不连接飞书或千牛，不发布商品。36 项回归覆盖恢复、防重提、控制释放、500 条批次的摘要输出及完整证据保留；模拟测试通过不等于真实店铺发布已验证。
+
+状态命令见 [state-api.md](skills/product-listing/references/state-api.md)：`init/apply/inspect` 默认返回摘要，`inspect <state> --record <id>` 查看单条完整记录，`inspect <state> --full` 查看全量决策。命令顺序及 JSON 输入不变；读取旧版 CLI 输出中 `actions` 的调用方需显式加 `--full`，导出的 `decide/updateFile` 编程接口仍返回完整决策。浏览器收尾见 [监督流程](skills/product-listing/references/supervision.md#浏览器收尾)。
 
 本仓库按私有项目管理。工具调用方式以本机当前工具文档为准，平台操作以实际页面和回执为准。发布前需明确操作范围；维护飞书资料不等于授权提交平台。
